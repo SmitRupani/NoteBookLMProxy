@@ -1,0 +1,117 @@
+export const dynamic = 'force-dynamic';
+
+import { NextResponse } from "next/server";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
+import { getPineconeClient } from "@/lib/pinecone";
+import { extractText, getDocumentProxy } from "unpdf";
+
+export async function POST(req: Request) {
+  try {
+    const formData = await req.formData();
+    const file = formData.get("file");
+
+    if (!file || !(file instanceof Blob)) {
+      return NextResponse.json({ error: "No valid PDF file provided" }, { status: 400 });
+    }
+
+    const buffer = Buffer.from(await file.arrayBuffer());
+
+    // 1. PDF EXTRACTION
+    const pdf = await getDocumentProxy(new Uint8Array(buffer));
+    const { text: fullText } = await extractText(pdf, { mergePages: true });
+
+    console.log("Raw text length:", fullText.length);
+    console.log("Raw text sample:", fullText.slice(0, 300));
+
+    // SANITIZATION
+    const sanitizedText = fullText
+      .replace(/\0/g, "")
+      .replace(/[\u0000-\u0008\u000B-\u000C\u000E-\u001F]/g, "");
+
+    // 2. CHUNKING
+    const textSplitter = new RecursiveCharacterTextSplitter({
+      chunkSize: 1000,
+      chunkOverlap: 100,
+    });
+    const chunks = await textSplitter.splitText(sanitizedText);
+    const cleanChunks = chunks.filter((c) => c.trim().length > 5);
+
+    console.log("Chunks before filter:", chunks.length);
+    console.log("Chunks after filter:", cleanChunks.length);
+
+    // 3. GOOGLE EMBEDDINGS
+    const embeddings = new GoogleGenerativeAIEmbeddings({
+      apiKey: process.env.GOOGLE_API_KEY,
+      model: "models/gemini-embedding-001", // outputs 768 dimensions
+    });
+
+    // 4. PINECONE UPSERT
+    const pinecone = getPineconeClient();
+    const indexName = process.env.PINECONE_INDEX || "notebook-index";
+    const namespace = "pdf-ingestion-namespace";
+
+    // --- Safety check: verify the index exists before proceeding ---
+    const existingIndexes = await pinecone.listIndexes();
+    const indexNames = existingIndexes.indexes?.map((idx) => idx.name) ?? [];
+
+    if (!indexNames.includes(indexName)) {
+      // text-embedding-004 produces 768-dimensional vectors
+      await pinecone.createIndex({
+        name: indexName,
+        dimension: 768,
+        metric: "cosine",
+        spec: {
+          serverless: {
+            cloud: "aws",
+            region: "us-east-1", // change to your preferred region
+          },
+        },
+        waitUntilReady: true, // blocks until index is ready
+      });
+      console.log(`Index "${indexName}" created.`);
+    }
+
+    const pineconeIndex = pinecone.Index(indexName);
+
+    // Clear old namespace data
+    try {
+      await pineconeIndex.namespace(namespace).deleteAll();
+      await new Promise((r) => setTimeout(r, 1000));
+      console.log("Namespace cleared.");
+    } catch (e) {
+      console.log("Namespace clear skipped (likely empty).");
+    }
+
+    console.log("Generating embeddings and upserting...");
+
+    const vectors = await Promise.all(
+      cleanChunks.map(async (text, i) => {
+        const values = await embeddings.embedQuery(text);
+        return {
+          id: `vec-${Date.now()}-${i}`,
+          values,
+          metadata: { text },
+        };
+      })
+    );
+
+    console.log("Vectors generated:", vectors.length);
+    console.log("Sample vector length:", vectors[0]?.values?.length);
+
+    // ✅ Fix: upsert takes an array directly, but conflicting type definitions require us to bypass TS
+    // @ts-ignore
+    await pineconeIndex.namespace(namespace).upsert(vectors);
+
+    return NextResponse.json(
+      { message: "Success", chunksProcessed: cleanChunks.length },
+      { status: 200 }
+    );
+  } catch (error: any) {
+    console.error("Ingestion failed:", error);
+    return NextResponse.json(
+      { error: "Ingestion failed", details: error.message },
+      { status: 500 }
+    );
+  }
+}
