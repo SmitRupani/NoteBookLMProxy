@@ -2,8 +2,14 @@ export const dynamic = 'force-dynamic';
 
 import { NextResponse } from "next/server";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
-import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
-import { getPineconeClient } from "@/lib/pinecone";
+import { OpenAIEmbeddings } from "@langchain/openai";
+import {
+  getOpenRouterApiKey,
+  OPENROUTER_BASE_URL,
+  OPENROUTER_EMBED_DIMENSION,
+  OPENROUTER_EMBED_MODEL,
+} from "@/lib/openrouter";
+import { ensurePineconeIndex, getPineconeClient } from "@/lib/pinecone";
 import { extractText, getDocumentProxy } from "unpdf";
 
 export async function POST(req: Request) {
@@ -40,37 +46,24 @@ export async function POST(req: Request) {
     console.log("Chunks before filter:", chunks.length);
     console.log("Chunks after filter:", cleanChunks.length);
 
-    // 3. GOOGLE EMBEDDINGS
-    const embeddings = new GoogleGenerativeAIEmbeddings({
-      apiKey: process.env.GOOGLE_API_KEY,
-      model: "models/gemini-embedding-001", // outputs 768 dimensions
+    // 3. OPENROUTER EMBEDDINGS (OpenAI SDK compatible)
+    const openRouterApiKey = getOpenRouterApiKey();
+    const embeddings = new OpenAIEmbeddings({
+      apiKey: openRouterApiKey,
+      model: OPENROUTER_EMBED_MODEL,
+      configuration: {
+        baseURL: OPENROUTER_BASE_URL,
+      },
     });
 
     // 4. PINECONE UPSERT
     const pinecone = getPineconeClient();
-    const indexName = process.env.PINECONE_INDEX || "notebook-index";
+    const baseIndexName = process.env.PINECONE_INDEX || "notebook-index-openrouter";
+    const indexName = await ensurePineconeIndex(
+      baseIndexName,
+      OPENROUTER_EMBED_DIMENSION
+    );
     const namespace = "pdf-ingestion-namespace";
-
-    // --- Safety check: verify the index exists before proceeding ---
-    const existingIndexes = await pinecone.listIndexes();
-    const indexNames = existingIndexes.indexes?.map((idx) => idx.name) ?? [];
-
-    if (!indexNames.includes(indexName)) {
-      // text-embedding-004 produces 768-dimensional vectors
-      await pinecone.createIndex({
-        name: indexName,
-        dimension: 768,
-        metric: "cosine",
-        spec: {
-          serverless: {
-            cloud: "aws",
-            region: "us-east-1", // change to your preferred region
-          },
-        },
-        waitUntilReady: true, // blocks until index is ready
-      });
-      console.log(`Index "${indexName}" created.`);
-    }
 
     const pineconeIndex = pinecone.Index(indexName);
 
@@ -79,38 +72,47 @@ export async function POST(req: Request) {
       await pineconeIndex.namespace(namespace).deleteAll();
       await new Promise((r) => setTimeout(r, 1000));
       console.log("Namespace cleared.");
-    } catch (e) {
+    } catch {
       console.log("Namespace clear skipped (likely empty).");
     }
 
     console.log("Generating embeddings and upserting...");
 
-    const vectors = await Promise.all(
-      cleanChunks.map(async (text, i) => {
-        const values = await embeddings.embedQuery(text);
-        return {
-          id: `vec-${Date.now()}-${i}`,
-          values,
-          metadata: { text },
-        };
-      })
-    );
+    const chunkEmbeddings = await embeddings.embedDocuments(cleanChunks);
+
+    const vectors = cleanChunks.map((text, i) => {
+      const values = chunkEmbeddings[i];
+      if (!values) {
+        throw new Error(`Embedding generation failed for chunk ${i}`);
+      }
+
+      return {
+        id: `vec-${Date.now()}-${i}`,
+        values,
+        metadata: {
+          text,
+          pageContent: text,
+          content: text,
+          chunk: text,
+          chunkIndex: i,
+        },
+      };
+    });
 
     console.log("Vectors generated:", vectors.length);
     console.log("Sample vector length:", vectors[0]?.values?.length);
 
-    // ✅ Fix: upsert takes an array directly, but conflicting type definitions require us to bypass TS
-    // @ts-ignore
     await pineconeIndex.namespace(namespace).upsert(vectors);
 
     return NextResponse.json(
       { message: "Success", chunksProcessed: cleanChunks.length },
       { status: 200 }
     );
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("Ingestion failed:", error);
+    const details = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json(
-      { error: "Ingestion failed", details: error.message },
+      { error: "Ingestion failed", details },
       { status: 500 }
     );
   }
