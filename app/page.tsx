@@ -2,8 +2,25 @@
 
 import { useState } from "react";
 
+interface Message {
+  role: "user" | "ai";
+  content: string;
+  trace?: {
+    rewrittenQuery?: string;
+    subqueries?: string[];
+    evaluations?: {
+      text: string;
+      grade: "CORRECT" | "AMBIGUOUS" | "INCORRECT";
+      reason: string;
+    }[];
+    fallbackTriggered?: boolean;
+    fallbackType?: "NONE" | "SECONDARY_RETRIEVAL" | "GENERAL_KNOWLEDGE";
+    secondaryQuery?: string;
+  };
+}
+
 export default function Home() {
-  const [messages, setMessages] = useState<{ role: "user" | "ai"; content: string }[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isUploading, setIsUploading] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
@@ -54,7 +71,10 @@ export default function Home() {
       
       const data = await res.json();
       if (res.ok) {
-        setMessages((prev) => [...prev, { role: "ai", content: data.reply }]);
+        setMessages((prev) => [
+          ...prev,
+          { role: "ai", content: data.reply, trace: data.trace },
+        ]);
       } else {
         setMessages((prev) => [...prev, { role: "ai", content: "Error: " + data.error }]);
       }
@@ -132,6 +152,71 @@ export default function Home() {
                 <div key={i} className={`message-row ${msg.role === "user" ? "user" : "ai"}`}>
                   <div className="message-bubble">
                     <p>{msg.content}</p>
+                    
+                    {msg.trace && (
+                      <details className="rag-trace">
+                        <summary className="rag-trace-summary">
+                          <span className="rag-trace-icon">
+                            <svg style={{ width: '1rem', height: '1rem' }} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                            </svg>
+                            RAG Pipeline Trace
+                          </span>
+                          <span>⚡</span>
+                        </summary>
+                        <div className="rag-trace-details">
+                          {msg.trace.rewrittenQuery && (
+                            <div className="trace-item">
+                              <span className="trace-label">Query Rewriting</span>
+                              <div className="trace-value">{msg.trace.rewrittenQuery}</div>
+                            </div>
+                          )}
+
+                          {msg.trace.subqueries && msg.trace.subqueries.length > 0 && (
+                            <div className="trace-item">
+                              <span className="trace-label">Sub-Query Decomposition</span>
+                              <div className="trace-subqueries-list">
+                                {msg.trace.subqueries.map((sq, idx) => (
+                                  <span key={idx} className="trace-subquery-tag">{sq}</span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {msg.trace.fallbackTriggered && (
+                            <div className="trace-fallback-banner">
+                              <span>⚠️</span>
+                              <div>
+                                <strong>Corrective Action (CRAG) Triggered:</strong> {msg.trace.fallbackType === "SECONDARY_RETRIEVAL" ? "Secondary Retrieval Attempt" : "General Knowledge Fallback"}
+                                {msg.trace.secondaryQuery && <div style={{ marginTop: '0.2rem', opacity: 0.85 }}>Secondary Search: "{msg.trace.secondaryQuery}"</div>}
+                              </div>
+                            </div>
+                          )}
+
+                          {msg.trace.evaluations && msg.trace.evaluations.length > 0 && (
+                            <div className="trace-item">
+                              <span className="trace-label">Chunk Evaluations (CRAG)</span>
+                              <div className="trace-evals">
+                                {msg.trace.evaluations.map((ev, idx) => (
+                                  <div key={idx} className="trace-chunk-card">
+                                    <div className="trace-chunk-header">
+                                      <span className="text-xs text-neutral-400 font-mono">Chunk {idx + 1}</span>
+                                      <span className={`trace-badge ${ev.grade.toLowerCase()}`}>{ev.grade}</span>
+                                    </div>
+                                    <div className="trace-chunk-text" title="Hover/Click to expand.">
+                                      {ev.text}
+                                    </div>
+                                    <div className="trace-chunk-reason">
+                                      Reason: {ev.reason}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </details>
+                    )}
                   </div>
                 </div>
               ))}
